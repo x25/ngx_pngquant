@@ -4,6 +4,8 @@
 
 #include <gd.h>
 
+#include "../deps/pngquant/lib/libimagequant.h"
+
 
 #define NGX_HTTP_PNGQUANT_START     0
 #define NGX_HTTP_PNGQUANT_READ      1
@@ -329,6 +331,148 @@ ngx_http_pngquant_cleanup(void *data)
 }
 
 
+static void
+ngx_pngquant_free_true_color_image_data(gdImagePtr oim)
+{
+	int i;
+	oim->trueColor = 0;
+	/* Junk the truecolor pixels */
+	for (i = 0; i < oim->sy; i++) {
+		gdFree (oim->tpixels[i]);
+	}
+	free (oim->tpixels);
+	oim->tpixels = 0;
+}
+
+
+static void
+ngx_pngquant_convert_gd_pixel_to_rgba(liq_color output_row[], int y, int width, void *userinfo)
+{
+	gdImagePtr oim = userinfo;
+	int x;
+	for(x = 0; x < width; x++) {
+		output_row[x].r = gdTrueColorGetRed(oim->tpixels[y][x]) * 255/gdRedMax;
+		output_row[x].g = gdTrueColorGetGreen(oim->tpixels[y][x]) * 255/gdGreenMax;
+		output_row[x].b = gdTrueColorGetBlue(oim->tpixels[y][x]) * 255/gdBlueMax;
+		int alpha = gdTrueColorGetAlpha(oim->tpixels[y][x]);
+		if (gdAlphaOpaque < gdAlphaTransparent) {
+			alpha = gdAlphaTransparent - alpha;
+		}
+		output_row[x].a = alpha * 255/gdAlphaMax;
+	}
+}
+
+
+static int
+ngx_pngquant_gd_image(gdImagePtr oim, int dither, int colorsWanted)
+{
+	int i;
+
+	int maxColors = gdMaxColors;
+
+	if (!oim->trueColor) {
+
+		return 1;
+	}
+
+	/* If we have a transparent color (the alphaless mode of transparency), we
+	 * must reserve a palette entry for it at the end of the palette. */
+	if (oim->transparent >= 0) {
+		maxColors--;
+	}
+	if (colorsWanted > maxColors) {
+		colorsWanted = maxColors;
+	}
+
+        oim->pixels = calloc(sizeof (unsigned char *), oim->sy);
+        if (!oim->pixels) {
+                /* No can do */
+                goto outOfMemory;
+        }
+        for (i = 0; (i < oim->sy); i++) {
+                oim->pixels[i] = (unsigned char *) calloc(sizeof (unsigned char *), oim->sx);
+                if (!oim->pixels[i]) {
+                        goto outOfMemory;
+                }
+        }
+
+	if (oim->paletteQuantizationMethod == GD_QUANT_DEFAULT ||
+	        oim->paletteQuantizationMethod == GD_QUANT_LIQ) {
+		liq_attr *attr = liq_attr_create_with_allocator(malloc, gdFree);
+		liq_image *image;
+		liq_result *remap;
+		int remapped_ok = 0;
+
+		liq_set_max_colors(attr, colorsWanted);
+
+		/* by default make it fast to match speed of previous implementation */
+		liq_set_speed(attr, oim->paletteQuantizationSpeed ? oim->paletteQuantizationSpeed : 9);
+		if (oim->paletteQuantizationMaxQuality) {
+			liq_set_quality(attr, oim->paletteQuantizationMinQuality, oim->paletteQuantizationMaxQuality);
+		}
+		image = liq_image_create_custom(attr, ngx_pngquant_convert_gd_pixel_to_rgba, oim, oim->sx, oim->sy, 0);
+		remap = liq_quantize_image(attr, image);
+		if (!remap) { /* minimum quality not met, leave image unmodified */
+			liq_image_destroy(image);
+			liq_attr_destroy(attr);
+			goto outOfMemory;
+		}
+
+		liq_set_dithering_level(remap, dither ? 1 : 0);
+		if (LIQ_OK == liq_write_remapped_image_rows(remap, image, oim->pixels)) {
+			remapped_ok = 1;
+			const liq_palette *pal = liq_get_palette(remap);
+			oim->transparent = -1;
+			unsigned int icolor;
+			for(icolor=0; icolor < pal->count; icolor++) {
+				oim->open[icolor] = 0;
+				oim->red[icolor] = pal->entries[icolor].r * gdRedMax/255;
+				oim->green[icolor] = pal->entries[icolor].g * gdGreenMax/255;
+				oim->blue[icolor] = pal->entries[icolor].b * gdBlueMax/255;
+				int alpha = pal->entries[icolor].a * gdAlphaMax/255;
+				if (gdAlphaOpaque < gdAlphaTransparent) {
+					alpha = gdAlphaTransparent - alpha;
+				}
+				oim->alpha[icolor] = alpha;
+				if (oim->transparent == -1 && alpha == gdAlphaTransparent) {
+					oim->transparent = icolor;
+				}
+			}
+			oim->colorsTotal = pal->count;
+		}
+		liq_result_destroy(remap);
+		liq_image_destroy(image);
+		liq_attr_destroy(attr);
+
+		if (remapped_ok) {
+
+                        ngx_pngquant_free_true_color_image_data(oim);
+
+			return 1;
+		}
+	}
+
+outOfMemory:
+
+        if (oim->trueColor) {
+
+            /* On failure only */
+            if (oim->pixels) {
+                    for (i = 0; i < oim->sy; i++) {
+                            if (oim->pixels[i]) {
+                                    gdFree (oim->pixels[i]);
+                            }
+                    }
+                    gdFree (oim->pixels);
+            }
+            oim->pixels = NULL;
+
+	}
+
+	return 0;
+}
+
+
 static ngx_buf_t *
 ngx_http_pngquant_quantize(ngx_http_request_t *r, ngx_http_pngquant_ctx_t *ctx)
 {
@@ -351,8 +495,11 @@ ngx_http_pngquant_quantize(ngx_http_request_t *r, ngx_http_pngquant_ctx_t *ctx)
 
     conf = ngx_http_get_module_loc_conf(r, ngx_http_pngquant_module);
 
-    gdImageTrueColorToPaletteSetMethod(img, GD_QUANT_LIQ, conf->speed);
-    gdImageTrueColorToPalette(img, conf->dither, conf->colors);
+//    Unfortunately this will not work in the last libgd build
+//    gdImageTrueColorToPaletteSetMethod(img, GD_QUANT_LIQ, conf->speed);
+//    gdImageTrueColorToPalette(img, conf->dither, conf->colors);
+
+    ngx_pngquant_gd_image(img, conf->dither, conf->colors);
 
     out = gdImagePngPtr(img, &size);
 
@@ -395,7 +542,7 @@ ngx_http_pngquant_quantize(ngx_http_request_t *r, ngx_http_pngquant_ctx_t *ctx)
     b->last_buf = 1;
 
     ngx_http_pngquant_length(r, b);
-    ngx_http_weak_etag(r);
+//    ngx_http_weak_etag(r);
 
     return b;
 }

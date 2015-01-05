@@ -32,16 +32,23 @@ sudo yum install gcc-c++ gd-devel make
 ```sh
 sudo apt-get install build-essential libgd-dev
 ```
+Download `ngx_pngquant` module and install dependencies:
+
+```sh
+cd
+git clone https://github.com/x25/ngx_pngquant
+cd ngx_pngquant
+git submodule update --init
+```
 
 Download and build **nginx**/**openresty** with support for pngquant: 
 
 ```sh
 cd
 # check http://nginx.org/en/download.html for the latest version
-NGINX_VERSION=1.6.2
-wget http://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz
-tar -xvzf nginx-${NGINX_VERSION}.tar.gz
-cd nginx-${NGINX_VERSION}/
+wget http://nginx.org/download/nginx-1.6.2.tar.gz
+tar -xvzf nginx-1.6.2.tar.gz
+cd nginx-1.6.2/
 ./configure --add-module=$HOME/ngx_pngquant
 make
 sudo make install

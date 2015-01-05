@@ -1,4 +1,7 @@
 ngx_addon_name=ngx_http_pngquant_module
 USE_LIBGD=YES
 HTTP_AUX_FILTER_MODULES="$HTTP_AUX_FILTER_MODULES ngx_http_pngquant_module"
-NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_addon_dir/ngx_http_pngquant_module.c"
+NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_addon_dir/deps/pngquant/lib/*.c"
+NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_addon_dir/src/ngx_http_pngquant_module.c"
+CFLAGS="$CFLAGS -std=c99 -DNDEBUG -Wno-error=sign-compare -Wno-error=unknown-pragmas"
+CORE_LIBS="$CORE_LIBS -lm"

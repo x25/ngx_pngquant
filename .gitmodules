@@ -1,0 +1,3 @@
+[submodule "deps/pngquant"]
+	path = deps/pngquant
+	url = https://github.com/pornel/pngquant
