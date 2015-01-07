@@ -8,7 +8,7 @@ The ``ngx_pngquant`` module is a filter for lossy compression of PNG images.
 ## Example Configuration
 
 ```nginx
-location ~ \.png {
+location ~ \.png$ {
     pngquant on;
     pngquant_buffer_size 1M;
     pngquant_colors 256;
@@ -21,18 +21,19 @@ location ~ \.png {
 
 Install module dependencies:
 
+**Ubuntu or Debian**
+
+```sh
+sudo apt-get install build-essential libgd-dev
+```
+
 **RedHat, CentOS, or Fedora**
 
 ```sh
 sudo yum install gcc-c++ gd-devel make
 ```
 
-**Ubuntu or Debian**
-
-```sh
-sudo apt-get install build-essential libgd-dev
-```
-Download `ngx_pngquant` module and install dependencies:
+Download `ngx_pngquant` and install [libimagequant](https://github.com/pornel/pngquant) submodule:
 
 ```sh
 cd
@@ -41,7 +42,7 @@ cd ngx_pngquant
 git submodule update --init
 ```
 
-Download and build **nginx**/**openresty** with support for pngquant: 
+Download and build **nginx**/**openresty** with support for ``ngx_pngquant``:
 
 ```sh
 cd

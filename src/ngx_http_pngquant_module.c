@@ -1,6 +1,18 @@
+/*
+* Copyright (C) Igor Sysoev
+* Copyright (C) Nginx, Inc.
+* Copyright (C) Kornel Lesiński (libimagequant)
+* Copyright (C) FRiCKLE <info@frickle.com> (ngx_slowfs_cache)
+* Copyright (C) Thomas G. Lane. (libgd)
+* Copyright (C) x25 <job@x25.ru>
+*/
+
+//#if (NGX_HTTP_CACHE)
+
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
+#include <nginx.h>
 
 #include <gd.h>
 
@@ -18,11 +30,15 @@
 
 
 typedef struct {
-    ngx_flag_t                   quantize;
+    ngx_flag_t                   enabled;
     size_t                       buffer_size;
     ngx_flag_t                   dither;
     ngx_uint_t                   colors;
     ngx_uint_t                   speed;
+    ngx_shm_zone_t              *cache;
+    ngx_array_t                 *cache_valid;
+    ngx_http_complex_value_t     cache_key;
+    ngx_path_t                  *temp_path;
 } ngx_http_pngquant_conf_t;
 
 
@@ -31,13 +47,21 @@ typedef struct {
     u_char                      *last;
     size_t                       length;
     ngx_uint_t                   phase;
+    ngx_uint_t                   cache_status;
 } ngx_http_pngquant_ctx_t;
 
 
+ngx_module_t  ngx_http_pngquant_module;
+
+static ngx_int_t ngx_http_pngquant_header_filter(ngx_http_request_t *r);
 static void *ngx_http_pngquant_create_conf(ngx_conf_t *cf);
 static char *ngx_http_pngquant_merge_conf(ngx_conf_t *cf, void *parent,
     void *child);
 static ngx_int_t ngx_http_pngquant_init(ngx_conf_t *cf);
+char * ngx_http_pngquant_cache_conf(ngx_conf_t *ngx_cf, ngx_command_t *cmd,
+    void *conf);
+char * ngx_http_pngquant_cache_key_conf(ngx_conf_t *ngx_cf, ngx_command_t *cmd,
+    void *conf);
 
 
 static ngx_command_t  ngx_http_pngquant_commands[] = {
@@ -46,7 +70,7 @@ static ngx_command_t  ngx_http_pngquant_commands[] = {
       NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_pngquant_conf_t, quantize),
+      offsetof(ngx_http_pngquant_conf_t, enabled),
       NULL },
 
     { ngx_string("pngquant_buffer_size"),
@@ -75,6 +99,41 @@ static ngx_command_t  ngx_http_pngquant_commands[] = {
       ngx_conf_set_num_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_pngquant_conf_t, speed),
+      NULL },
+
+    { ngx_string("pngquant_cache"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_http_pngquant_cache_conf,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("pngquant_cache_key"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_http_pngquant_cache_key_conf,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("pngquant_cache_valid"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
+      ngx_http_file_cache_valid_set_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pngquant_conf_t, cache_valid),
+      NULL },
+
+    { ngx_string("pngquant_cache_path"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_2MORE,
+      ngx_http_file_cache_set_slot,
+      0,
+      0,
+      &ngx_http_pngquant_module },
+
+    { ngx_string("pngquant_temp_path"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1234,
+      ngx_conf_set_path_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pngquant_conf_t, temp_path),
       NULL },
 
       ngx_null_command
@@ -116,74 +175,75 @@ static ngx_http_output_header_filter_pt  ngx_http_next_header_filter;
 static ngx_http_output_body_filter_pt    ngx_http_next_body_filter;
 
 
+static ngx_path_init_t ngx_http_pngquant_temp_path = {
+    ngx_string("/tmp"), { 1, 2, 0 }
+};
+
+
 static ngx_str_t  ngx_http_pngquant_content_type[] = {
     ngx_string("image/png")
 };
 
 
-static ngx_int_t
-ngx_http_pngquant_header_filter(ngx_http_request_t *r)
+char *
+ngx_http_pngquant_cache_conf(ngx_conf_t *ngx_cf, ngx_command_t *cmd, void *conf)
 {
-    off_t                     len;
-    ngx_http_pngquant_ctx_t   *ctx;
-    ngx_http_pngquant_conf_t  *conf;
+    ngx_str_t *value = ngx_cf->args->elts;
 
-    if (r->headers_out.status == NGX_HTTP_NOT_MODIFIED) {
+    ngx_http_pngquant_conf_t *cf = conf;
 
-        return ngx_http_next_header_filter(r);
+    if (cf->cache != NGX_CONF_UNSET_PTR && cf->cache != NULL) {
+
+        return "duplicate";
     }
 
-    ctx = ngx_http_get_module_ctx(r, ngx_http_pngquant_module);
+    if (ngx_strcmp(value[1].data, "off") == 0) {
 
-    if (ctx) {
+        cf->enabled = 0;
+        cf->cache = NULL;
 
-        ngx_http_set_ctx(r, NULL, ngx_http_pngquant_module);
-
-        return ngx_http_next_header_filter(r);
+        return NGX_CONF_OK;
     }
 
-    conf = ngx_http_get_module_loc_conf(r, ngx_http_pngquant_module);
+    cf->cache = ngx_shared_memory_add(ngx_cf, &value[1], 0,
+        &ngx_http_pngquant_module);
 
-    if (!conf->quantize) {
+    if (cf->cache == NULL) {
 
-        return ngx_http_next_header_filter(r);
+        return NGX_CONF_ERROR;
     }
 
-    ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_pngquant_ctx_t));
+    cf->enabled = 1;
 
-    if (ctx == NULL) {
+    return NGX_CONF_OK;
+}
 
-        return NGX_ERROR;
+
+char *
+ngx_http_pngquant_cache_key_conf(ngx_conf_t *ngx_cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_str_t *value = ngx_cf->args->elts;
+    ngx_http_pngquant_conf_t *cf = conf;
+    ngx_http_compile_complex_value_t ccv;
+
+    if (cf->cache_key.value.len) {
+
+        return "duplicate";
     }
 
-    ngx_http_set_ctx(r, ctx, ngx_http_pngquant_module);
+    ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
 
-    len = r->headers_out.content_length_n;
+    ccv.cf = ngx_cf;
+    ccv.value = &value[1];
+    ccv.complex_value = &cf->cache_key;
 
-    if (len != -1 && len > (off_t) conf->buffer_size) {
+    if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
 
-        return NGX_HTTP_UNSUPPORTED_MEDIA_TYPE;
+        return NGX_CONF_ERROR;
     }
 
-    if (len == -1) {
-
-        ctx->length = conf->buffer_size;
-
-    } else {
-
-        ctx->length = (size_t) len;
-    }
-
-    if (r->headers_out.refresh) {
-
-        r->headers_out.refresh->hash = 0;
-    }
-
-    r->main_filter_need_in_memory = 1;
-
-    r->allow_ranges = 0;
-
-    return NGX_OK;
+    return NGX_CONF_OK;
 }
 
 
@@ -237,10 +297,10 @@ static ngx_int_t
 ngx_http_pngquant_read(ngx_http_request_t *r, ngx_chain_t *in)
 {
     u_char                   *p;
-    size_t                   size, rest;
     ngx_buf_t                *b;
     ngx_chain_t              *cl;
     ngx_http_pngquant_ctx_t  *ctx;
+    size_t                    size, rest;
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_pngquant_module);
 
@@ -334,154 +394,198 @@ ngx_http_pngquant_cleanup(void *data)
 static void
 ngx_pngquant_free_true_color_image_data(gdImagePtr oim)
 {
-	int i;
-	oim->trueColor = 0;
-	/* Junk the truecolor pixels */
-	for (i = 0; i < oim->sy; i++) {
-		gdFree (oim->tpixels[i]);
-	}
-	free (oim->tpixels);
-	oim->tpixels = 0;
+    int i;
+    oim->trueColor = 0;
+    /* Junk the truecolor pixels */
+    for (i = 0; i < oim->sy; i++) {
+            gdFree (oim->tpixels[i]);
+    }
+    free (oim->tpixels);
+    oim->tpixels = 0;
 }
 
 
 static void
-ngx_pngquant_convert_gd_pixel_to_rgba(liq_color output_row[], int y, int width, void *userinfo)
+ngx_pngquant_convert_gd_pixel_to_rgba(liq_color output_row[], int y, int width,
+    void *userinfo)
 {
-	gdImagePtr oim = userinfo;
-	int x;
-	for(x = 0; x < width; x++) {
-		output_row[x].r = gdTrueColorGetRed(oim->tpixels[y][x]) * 255/gdRedMax;
-		output_row[x].g = gdTrueColorGetGreen(oim->tpixels[y][x]) * 255/gdGreenMax;
-		output_row[x].b = gdTrueColorGetBlue(oim->tpixels[y][x]) * 255/gdBlueMax;
-		int alpha = gdTrueColorGetAlpha(oim->tpixels[y][x]);
-		if (gdAlphaOpaque < gdAlphaTransparent) {
-			alpha = gdAlphaTransparent - alpha;
-		}
-		output_row[x].a = alpha * 255/gdAlphaMax;
-	}
+    gdImagePtr oim = userinfo;
+    int x;
+
+    for(x = 0; x < width; x++) {
+
+        output_row[x].r = gdTrueColorGetRed(oim->tpixels[y][x]) * 255/gdRedMax;
+        output_row[x].g = gdTrueColorGetGreen(oim->tpixels[y][x]) * 255/gdGreenMax;
+        output_row[x].b = gdTrueColorGetBlue(oim->tpixels[y][x]) * 255/gdBlueMax;
+
+        int alpha = gdTrueColorGetAlpha(oim->tpixels[y][x]);
+
+        if (gdAlphaOpaque < gdAlphaTransparent) {
+
+            alpha = gdAlphaTransparent - alpha;
+        }
+
+        output_row[x].a = alpha * 255/gdAlphaMax;
+    }
 }
 
 
 static int
-ngx_pngquant_gd_image(gdImagePtr oim, int dither, int colorsWanted)
+ngx_pngquant_gd_image(gdImagePtr oim, int dither, int colorsWanted, int speed)
 {
-	int i;
+    int i;
 
-	int maxColors = gdMaxColors;
+    int maxColors = gdMaxColors;
 
-	if (!oim->trueColor) {
+    if (!oim->trueColor) {
 
-		return 1;
-	}
+        return 1;
+    }
 
-	/* If we have a transparent color (the alphaless mode of transparency), we
-	 * must reserve a palette entry for it at the end of the palette. */
-	if (oim->transparent >= 0) {
-		maxColors--;
-	}
-	if (colorsWanted > maxColors) {
-		colorsWanted = maxColors;
-	}
+    /* If we have a transparent color (the alphaless mode of transparency), we
+     * must reserve a palette entry for it at the end of the palette. */
+    if (oim->transparent >= 0) {
 
-        oim->pixels = calloc(sizeof (unsigned char *), oim->sy);
-        if (!oim->pixels) {
-                /* No can do */
+        maxColors--;
+    }
+
+    if (colorsWanted > maxColors) {
+
+        colorsWanted = maxColors;
+    }
+
+    oim->pixels = calloc(sizeof (unsigned char *), oim->sy);
+
+    if (!oim->pixels) {
+            /* No can do */
+        goto outOfMemory;
+    }
+
+    for (i = 0; (i < oim->sy); i++) {
+
+        oim->pixels[i] = (unsigned char *) calloc(sizeof (unsigned char *),
+                                                  oim->sx);
+
+        if (!oim->pixels[i]) {
                 goto outOfMemory;
         }
-        for (i = 0; (i < oim->sy); i++) {
-                oim->pixels[i] = (unsigned char *) calloc(sizeof (unsigned char *), oim->sx);
-                if (!oim->pixels[i]) {
-                        goto outOfMemory;
-                }
+    }
+
+    liq_attr *attr = liq_attr_create_with_allocator(malloc, gdFree);
+
+    liq_image *image;
+    liq_result *remap;
+    int remapped_ok = 0;
+
+    liq_set_max_colors(attr, colorsWanted);
+
+    /* by default make it fast to match speed of previous implementation */
+    liq_set_speed(attr, speed ? speed : 9);
+
+    if (oim->paletteQuantizationMaxQuality) {
+
+        liq_set_quality(attr,
+                        oim->paletteQuantizationMinQuality,
+                        oim->paletteQuantizationMaxQuality);
+    }
+
+    image = liq_image_create_custom(attr, ngx_pngquant_convert_gd_pixel_to_rgba,
+                                    oim, oim->sx, oim->sy, 0);
+    remap = liq_quantize_image(attr, image);
+
+    if (!remap) { /* minimum quality not met, leave image unmodified */
+
+        liq_image_destroy(image);
+        liq_attr_destroy(attr);
+
+        goto outOfMemory;
+    }
+
+    liq_set_dithering_level(remap, dither ? 1 : 0);
+
+    if (LIQ_OK == liq_write_remapped_image_rows(remap, image, oim->pixels)) {
+
+        remapped_ok = 1;
+
+        const liq_palette *pal = liq_get_palette(remap);
+
+        oim->transparent = -1;
+
+        unsigned int icolor;
+
+        for(icolor=0; icolor < pal->count; icolor++) {
+
+            oim->open[icolor] = 0;
+            oim->red[icolor] = pal->entries[icolor].r * gdRedMax/255;
+            oim->green[icolor] = pal->entries[icolor].g * gdGreenMax/255;
+            oim->blue[icolor] = pal->entries[icolor].b * gdBlueMax/255;
+
+            int alpha = pal->entries[icolor].a * gdAlphaMax/255;
+
+            if (gdAlphaOpaque < gdAlphaTransparent) {
+
+                alpha = gdAlphaTransparent - alpha;
+            }
+
+            oim->alpha[icolor] = alpha;
+
+            if (oim->transparent == -1 && alpha == gdAlphaTransparent) {
+
+                oim->transparent = icolor;
+            }
         }
 
-	if (oim->paletteQuantizationMethod == GD_QUANT_DEFAULT ||
-	        oim->paletteQuantizationMethod == GD_QUANT_LIQ) {
-		liq_attr *attr = liq_attr_create_with_allocator(malloc, gdFree);
-		liq_image *image;
-		liq_result *remap;
-		int remapped_ok = 0;
+        oim->colorsTotal = pal->count;
+    }
 
-		liq_set_max_colors(attr, colorsWanted);
+    liq_result_destroy(remap);
+    liq_image_destroy(image);
+    liq_attr_destroy(attr);
 
-		/* by default make it fast to match speed of previous implementation */
-		liq_set_speed(attr, oim->paletteQuantizationSpeed ? oim->paletteQuantizationSpeed : 9);
-		if (oim->paletteQuantizationMaxQuality) {
-			liq_set_quality(attr, oim->paletteQuantizationMinQuality, oim->paletteQuantizationMaxQuality);
-		}
-		image = liq_image_create_custom(attr, ngx_pngquant_convert_gd_pixel_to_rgba, oim, oim->sx, oim->sy, 0);
-		remap = liq_quantize_image(attr, image);
-		if (!remap) { /* minimum quality not met, leave image unmodified */
-			liq_image_destroy(image);
-			liq_attr_destroy(attr);
-			goto outOfMemory;
-		}
+    if (remapped_ok) {
 
-		liq_set_dithering_level(remap, dither ? 1 : 0);
-		if (LIQ_OK == liq_write_remapped_image_rows(remap, image, oim->pixels)) {
-			remapped_ok = 1;
-			const liq_palette *pal = liq_get_palette(remap);
-			oim->transparent = -1;
-			unsigned int icolor;
-			for(icolor=0; icolor < pal->count; icolor++) {
-				oim->open[icolor] = 0;
-				oim->red[icolor] = pal->entries[icolor].r * gdRedMax/255;
-				oim->green[icolor] = pal->entries[icolor].g * gdGreenMax/255;
-				oim->blue[icolor] = pal->entries[icolor].b * gdBlueMax/255;
-				int alpha = pal->entries[icolor].a * gdAlphaMax/255;
-				if (gdAlphaOpaque < gdAlphaTransparent) {
-					alpha = gdAlphaTransparent - alpha;
-				}
-				oim->alpha[icolor] = alpha;
-				if (oim->transparent == -1 && alpha == gdAlphaTransparent) {
-					oim->transparent = icolor;
-				}
-			}
-			oim->colorsTotal = pal->count;
-		}
-		liq_result_destroy(remap);
-		liq_image_destroy(image);
-		liq_attr_destroy(attr);
+        ngx_pngquant_free_true_color_image_data(oim);
 
-		if (remapped_ok) {
-
-                        ngx_pngquant_free_true_color_image_data(oim);
-
-			return 1;
-		}
-	}
+        return 1;
+    }
 
 outOfMemory:
 
-        if (oim->trueColor) {
+    if (oim->trueColor) {
 
-            /* On failure only */
-            if (oim->pixels) {
-                    for (i = 0; i < oim->sy; i++) {
-                            if (oim->pixels[i]) {
-                                    gdFree (oim->pixels[i]);
-                            }
-                    }
-                    gdFree (oim->pixels);
+        /* On failure only */
+        if (oim->pixels) {
+
+            for (i = 0; i < oim->sy; i++) {
+
+                if (oim->pixels[i]) {
+                        gdFree (oim->pixels[i]);
+                }
             }
-            oim->pixels = NULL;
 
-	}
+            gdFree (oim->pixels);
+        }
 
-	return 0;
+        oim->pixels = NULL;
+    }
+
+    return 0;
 }
+
+
+/*@TODO*/
 
 
 static ngx_buf_t *
 ngx_http_pngquant_quantize(ngx_http_request_t *r, ngx_http_pngquant_ctx_t *ctx)
 {
-    int                       size;
     u_char                    *out;
     ngx_buf_t                 *b;
-    gdImagePtr                img;
     ngx_pool_cleanup_t        *cln;
     ngx_http_pngquant_conf_t  *conf;
+    gdImagePtr                 img;
+//    time_t                     valid;
+    int                        size;
 
     img = gdImageCreateFromPngPtr(ctx->length, ctx->image);
 
@@ -495,11 +599,12 @@ ngx_http_pngquant_quantize(ngx_http_request_t *r, ngx_http_pngquant_ctx_t *ctx)
 
     conf = ngx_http_get_module_loc_conf(r, ngx_http_pngquant_module);
 
-//    Unfortunately this will not work in the last libgd build
-//    gdImageTrueColorToPaletteSetMethod(img, GD_QUANT_LIQ, conf->speed);
-//    gdImageTrueColorToPalette(img, conf->dither, conf->colors);
+    /*
+     * gdImageTrueColorToPaletteSetMethod(img, GD_QUANT_LIQ, conf->speed);
+     * gdImageTrueColorToPalette(img, conf->dither, conf->colors);
+     */
 
-    ngx_pngquant_gd_image(img, conf->dither, conf->colors);
+    ngx_pngquant_gd_image(img, conf->dither, conf->colors, conf->speed);
 
     out = gdImagePngPtr(img, &size);
 
@@ -541,6 +646,8 @@ ngx_http_pngquant_quantize(ngx_http_request_t *r, ngx_http_pngquant_ctx_t *ctx)
     b->memory = 1;
     b->last_buf = 1;
 
+    /*@TODO*/
+
     ngx_http_pngquant_length(r, b);
 //    ngx_http_weak_etag(r);
 
@@ -560,7 +667,7 @@ ngx_http_pngquant_process(ngx_http_request_t *r)
 
     conf = ngx_http_get_module_loc_conf(r, ngx_http_pngquant_module);
 
-    if (conf->quantize) {
+    if (conf->enabled) {
 
         return ngx_http_pngquant_quantize(r, ctx);
     }
@@ -572,14 +679,15 @@ ngx_http_pngquant_process(ngx_http_request_t *r)
 static ngx_int_t
 ngx_http_pngquant_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 {
-    ngx_int_t                 rc;
+    ngx_int_t                  rc;
     ngx_str_t                 *ct;
-    ngx_chain_t               out;
+    ngx_chain_t                out;
     ngx_http_pngquant_ctx_t   *ctx;
 
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "pngquant");
-
     if (in == NULL) {
+
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "pngquant_body_filter (!in)");
 
         return ngx_http_next_body_filter(r, in);
     }
@@ -588,8 +696,14 @@ ngx_http_pngquant_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
     if (ctx == NULL) {
 
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "pngquant_body_filter (!ctx)");
+
         return ngx_http_next_body_filter(r, in);
     }
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "pngquant_body_filter");
 
     switch (ctx->phase) {
 
@@ -662,6 +776,252 @@ ngx_http_pngquant_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 }
 
 
+ngx_int_t
+ngx_http_pngquant_cache_send(ngx_http_request_t *r)
+{
+    ngx_http_pngquant_conf_t  *conf;
+//    ngx_http_pngquant_ctx_t   *ctx;
+
+    ngx_http_cache_t *c;
+
+    ngx_str_t *key;
+    ngx_int_t rc;
+
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_pngquant_module);
+    /*@TODO! ctx = get_ctx(), ctx->cache_status = ...*/
+
+    c = r->cache;
+
+    if (c != NULL) {
+
+        goto skip_alloc;
+    }
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "pngquant_cache (alloc)");
+
+    c = ngx_pcalloc(r->pool, sizeof(ngx_http_cache_t));
+
+    if (c == NULL) {
+
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    rc = ngx_array_init(&c->keys, r->pool, 1, sizeof(ngx_str_t));
+
+    if (rc != NGX_OK) {
+
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    key = ngx_array_push(&c->keys);
+
+    if (key == NULL) {
+
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    rc = ngx_http_complex_value(r, &conf->cache_key, key);
+
+    if (rc != NGX_OK) {
+
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    r->cache = c;
+    c->body_start = ngx_pagesize;
+    c->min_uses = 1;
+    c->file_cache = conf->cache->data;
+    c->file.log = r->connection->log;
+    ngx_http_file_cache_create_key(r);
+
+skip_alloc:
+    rc = ngx_http_file_cache_open(r);
+
+    if (rc != NGX_OK) {
+
+        if (rc == NGX_HTTP_CACHE_STALE) {
+            /*
+            * Revert c->node->updating = 1, we want this to be true only when
+            * module is in the process of copying given file.
+            */
+            ngx_shmtx_lock(&c->file_cache->shpool->mutex);
+            c->node->updating = 0;
+
+            c->updating = 0;
+
+            ngx_shmtx_unlock(&c->file_cache->shpool->mutex);
+
+            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "pngquant_cache (stale)");
+
+        } else if (rc == NGX_HTTP_CACHE_UPDATING) {
+
+            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "pngquant_cache (updating)");
+
+        } else {
+
+            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "pngquant_cache (miss)");
+        }
+
+        return NGX_DECLINED;
+    }
+
+    r->connection->log->action = "sending cached response to client";
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "pngquant_cache (hit)");
+
+    r->headers_out.status = NGX_HTTP_OK;
+    r->headers_out.content_length_n = c->length - c->body_start;
+    r->headers_out.last_modified_time = c->last_modified;
+
+    if (ngx_http_set_content_type(r) != NGX_OK) {
+
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    r->allow_ranges = 1;
+
+    return ngx_http_cache_send(r);
+}
+
+
+static ngx_int_t
+ngx_http_pngquant_header_filter(ngx_http_request_t *r)
+{
+    off_t                      len;
+    ngx_http_pngquant_ctx_t   *ctx;
+    ngx_http_pngquant_conf_t  *conf;
+
+    if (r->headers_out.status == NGX_HTTP_NOT_MODIFIED) {
+
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "pngquant_header_filter (not_modified)");
+
+        return ngx_http_next_header_filter(r);
+    }
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_pngquant_module);
+
+    if (ctx) {
+
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "pngquant_header_filter (set_ctx)");
+
+        ngx_http_set_ctx(r, NULL, ngx_http_pngquant_module);
+
+        return ngx_http_next_header_filter(r);
+    }
+
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_pngquant_module);
+
+    if (!conf->enabled) {
+
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "pngquant_header_filter (!enabled)");
+
+        return ngx_http_next_header_filter(r);
+    }
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "pngquant_header_filter");
+
+    ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_pngquant_ctx_t));
+
+    if (ctx == NULL) {
+
+        return NGX_ERROR;
+    }
+
+    ngx_http_set_ctx(r, ctx, ngx_http_pngquant_module);
+
+    len = r->headers_out.content_length_n;
+
+    if (len != -1 && len > (off_t) conf->buffer_size) {
+
+        return NGX_HTTP_UNSUPPORTED_MEDIA_TYPE;
+    }
+
+    if (len == -1) {
+
+        ctx->length = conf->buffer_size;
+
+    } else {
+
+        ctx->length = (size_t) len;
+    }
+
+    if (r->headers_out.refresh) {
+
+        r->headers_out.refresh->hash = 0;
+    }
+
+    r->main_filter_need_in_memory = 1;
+
+    r->allow_ranges = 0;
+
+    return NGX_OK;
+}
+
+
+ngx_int_t
+ngx_http_pngquant_content_handler(ngx_http_request_t *r)
+{
+    ngx_http_pngquant_conf_t  *conf;
+    ngx_int_t rc;
+
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_pngquant_module);
+
+    if (!conf->enabled || !conf->cache) {
+
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "pngquant_content_handler (-)");
+
+        return NGX_DECLINED;
+    }
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "pngquant_content_handler (+)");
+
+    if (!(r->method & (NGX_HTTP_GET|NGX_HTTP_HEAD))) {
+
+        return NGX_HTTP_NOT_ALLOWED;
+    }
+
+    if (r->uri.data[r->uri.len - 1] == '/') {
+
+        return NGX_DECLINED;
+    }
+
+    rc = ngx_http_discard_request_body(r);
+
+    if (rc != NGX_OK) {
+
+        return rc;
+    }
+
+#if defined(nginx_version) \
+    && ((nginx_version < 7066) \
+            || ((nginx_version >= 8000) && (nginx_version < 8038)))
+    if (r->zero_in_uri) {
+
+        return NGX_DECLINED;
+    }
+#endif
+
+    rc = ngx_http_pngquant_cache_send(r);
+
+    if (rc == NGX_DECLINED) {
+
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "pngquant_content_handler (cache_miss)");
+    }
+
+    return rc;
+}
+
+
 static void *
 ngx_http_pngquant_create_conf(ngx_conf_t *cf)
 {
@@ -674,11 +1034,19 @@ ngx_http_pngquant_create_conf(ngx_conf_t *cf)
         return NULL;
     }
 
-    conf->quantize = NGX_CONF_UNSET;
+    /*
+     * via ngx_pcalloc():
+     * conf->cache_key = NULL;
+     * conf->temp_path = NULL;
+     */
+
+    conf->enabled = NGX_CONF_UNSET;
     conf->buffer_size = NGX_CONF_UNSET_SIZE;
     conf->dither = NGX_CONF_UNSET;
     conf->colors = NGX_CONF_UNSET_UINT;
     conf->speed = NGX_CONF_UNSET_UINT;
+    conf->cache = NGX_CONF_UNSET_PTR;
+    conf->cache_valid = NGX_CONF_UNSET_PTR;
 
     return conf;
 }
@@ -690,7 +1058,7 @@ ngx_http_pngquant_merge_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_http_pngquant_conf_t *prev = parent;
     ngx_http_pngquant_conf_t *conf = child;
 
-    ngx_conf_merge_value(conf->quantize, prev->quantize, 0);
+    ngx_conf_merge_value(conf->enabled, prev->enabled, 0);
 
     ngx_conf_merge_value(conf->dither, prev->dither, 1);
 
@@ -700,6 +1068,22 @@ ngx_http_pngquant_merge_conf(ngx_conf_t *cf, void *parent, void *child)
                               1 * 1024 * 1024);
 
     ngx_conf_merge_uint_value(conf->speed, prev->speed, 0);
+
+    ngx_conf_merge_ptr_value(conf->cache, prev->cache, NULL);
+
+    ngx_conf_merge_ptr_value(conf->cache_valid, prev->cache_valid, NULL);
+
+    if (conf->cache_key.value.data == NULL) {
+
+        conf->cache_key = prev->cache_key;
+    }
+
+    if (ngx_conf_merge_path_value(cf, &conf->temp_path, prev->temp_path,
+                                  &ngx_http_pngquant_temp_path) != NGX_OK)
+    {
+
+        return NGX_CONF_ERROR;
+    }
 
     if (conf->colors < 1) {
 
@@ -717,12 +1101,35 @@ ngx_http_pngquant_merge_conf(ngx_conf_t *cf, void *parent, void *child)
         return NGX_CONF_ERROR;
     }
 
+    if (conf->cache && conf->cache->data == NULL) {
+
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "\"pngquant_cache\" zone \"%V\" is unknown",
+                           &conf->cache->shm.name);
+
+        return NGX_CONF_ERROR;
+    }
+
     return NGX_CONF_OK;
 }
 
 static ngx_int_t
 ngx_http_pngquant_init(ngx_conf_t *cf)
 {
+    ngx_http_handler_pt *h;
+    ngx_http_core_main_conf_t *conf;
+
+    conf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
+
+    h = ngx_array_push(&conf->phases[NGX_HTTP_CONTENT_PHASE].handlers);
+
+    if (h == NULL) {
+
+        return NGX_ERROR;
+    }
+
+    *h = ngx_http_pngquant_content_handler;
+
     ngx_http_next_header_filter = ngx_http_top_header_filter;
     ngx_http_top_header_filter = ngx_http_pngquant_header_filter;
 
@@ -731,3 +1138,5 @@ ngx_http_pngquant_init(ngx_conf_t *cf)
 
     return NGX_OK;
 }
+
+//#endif /* NGX_HTTP_CACHE */
