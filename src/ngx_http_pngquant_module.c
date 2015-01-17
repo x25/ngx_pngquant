@@ -2,12 +2,10 @@
 * Copyright (C) Igor Sysoev
 * Copyright (C) Nginx, Inc.
 * Copyright (C) Kornel Lesiński (libimagequant)
-* Copyright (C) FRiCKLE <info@frickle.com> (ngx_slowfs_cache)
 * Copyright (C) Thomas G. Lane. (libgd)
 * Copyright (C) x25 <job@x25.ru>
 */
 
-//#if (NGX_HTTP_CACHE)
 
 #include <ngx_config.h>
 #include <ngx_core.h>
@@ -35,10 +33,6 @@ typedef struct {
     ngx_flag_t                   dither;
     ngx_uint_t                   colors;
     ngx_uint_t                   speed;
-    ngx_shm_zone_t              *cache;
-    ngx_array_t                 *cache_valid;
-    ngx_http_complex_value_t     cache_key;
-    ngx_path_t                  *temp_path;
 } ngx_http_pngquant_conf_t;
 
 
@@ -47,7 +41,6 @@ typedef struct {
     u_char                      *last;
     size_t                       length;
     ngx_uint_t                   phase;
-    ngx_uint_t                   cache_status;
 } ngx_http_pngquant_ctx_t;
 
 
@@ -58,10 +51,6 @@ static void *ngx_http_pngquant_create_conf(ngx_conf_t *cf);
 static char *ngx_http_pngquant_merge_conf(ngx_conf_t *cf, void *parent,
     void *child);
 static ngx_int_t ngx_http_pngquant_init(ngx_conf_t *cf);
-char * ngx_http_pngquant_cache_conf(ngx_conf_t *ngx_cf, ngx_command_t *cmd,
-    void *conf);
-char * ngx_http_pngquant_cache_key_conf(ngx_conf_t *ngx_cf, ngx_command_t *cmd,
-    void *conf);
 
 
 static ngx_command_t  ngx_http_pngquant_commands[] = {
@@ -99,41 +88,6 @@ static ngx_command_t  ngx_http_pngquant_commands[] = {
       ngx_conf_set_num_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_pngquant_conf_t, speed),
-      NULL },
-
-    { ngx_string("pngquant_cache"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
-      ngx_http_pngquant_cache_conf,
-      NGX_HTTP_LOC_CONF_OFFSET,
-      0,
-      NULL },
-
-    { ngx_string("pngquant_cache_key"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
-      ngx_http_pngquant_cache_key_conf,
-      NGX_HTTP_LOC_CONF_OFFSET,
-      0,
-      NULL },
-
-    { ngx_string("pngquant_cache_valid"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
-      ngx_http_file_cache_valid_set_slot,
-      NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_pngquant_conf_t, cache_valid),
-      NULL },
-
-    { ngx_string("pngquant_cache_path"),
-      NGX_HTTP_MAIN_CONF|NGX_CONF_2MORE,
-      ngx_http_file_cache_set_slot,
-      0,
-      0,
-      &ngx_http_pngquant_module },
-
-    { ngx_string("pngquant_temp_path"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1234,
-      ngx_conf_set_path_slot,
-      NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_pngquant_conf_t, temp_path),
       NULL },
 
       ngx_null_command
@@ -175,76 +129,9 @@ static ngx_http_output_header_filter_pt  ngx_http_next_header_filter;
 static ngx_http_output_body_filter_pt    ngx_http_next_body_filter;
 
 
-static ngx_path_init_t ngx_http_pngquant_temp_path = {
-    ngx_string("/tmp"), { 1, 2, 0 }
-};
-
-
 static ngx_str_t  ngx_http_pngquant_content_type[] = {
     ngx_string("image/png")
 };
-
-
-char *
-ngx_http_pngquant_cache_conf(ngx_conf_t *ngx_cf, ngx_command_t *cmd, void *conf)
-{
-    ngx_str_t *value = ngx_cf->args->elts;
-
-    ngx_http_pngquant_conf_t *cf = conf;
-
-    if (cf->cache != NGX_CONF_UNSET_PTR && cf->cache != NULL) {
-
-        return "duplicate";
-    }
-
-    if (ngx_strcmp(value[1].data, "off") == 0) {
-
-        cf->enabled = 0;
-        cf->cache = NULL;
-
-        return NGX_CONF_OK;
-    }
-
-    cf->cache = ngx_shared_memory_add(ngx_cf, &value[1], 0,
-        &ngx_http_pngquant_module);
-
-    if (cf->cache == NULL) {
-
-        return NGX_CONF_ERROR;
-    }
-
-    cf->enabled = 1;
-
-    return NGX_CONF_OK;
-}
-
-
-char *
-ngx_http_pngquant_cache_key_conf(ngx_conf_t *ngx_cf, ngx_command_t *cmd,
-    void *conf)
-{
-    ngx_str_t *value = ngx_cf->args->elts;
-    ngx_http_pngquant_conf_t *cf = conf;
-    ngx_http_compile_complex_value_t ccv;
-
-    if (cf->cache_key.value.len) {
-
-        return "duplicate";
-    }
-
-    ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
-
-    ccv.cf = ngx_cf;
-    ccv.value = &value[1];
-    ccv.complex_value = &cf->cache_key;
-
-    if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
-
-        return NGX_CONF_ERROR;
-    }
-
-    return NGX_CONF_OK;
-}
 
 
 static ngx_int_t
@@ -776,119 +663,6 @@ ngx_http_pngquant_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 }
 
 
-ngx_int_t
-ngx_http_pngquant_cache_send(ngx_http_request_t *r)
-{
-    ngx_http_pngquant_conf_t  *conf;
-//    ngx_http_pngquant_ctx_t   *ctx;
-
-    ngx_http_cache_t *c;
-
-    ngx_str_t *key;
-    ngx_int_t rc;
-
-    conf = ngx_http_get_module_loc_conf(r, ngx_http_pngquant_module);
-    /*@TODO! ctx = get_ctx(), ctx->cache_status = ...*/
-
-    c = r->cache;
-
-    if (c != NULL) {
-
-        goto skip_alloc;
-    }
-
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "pngquant_cache (alloc)");
-
-    c = ngx_pcalloc(r->pool, sizeof(ngx_http_cache_t));
-
-    if (c == NULL) {
-
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    rc = ngx_array_init(&c->keys, r->pool, 1, sizeof(ngx_str_t));
-
-    if (rc != NGX_OK) {
-
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    key = ngx_array_push(&c->keys);
-
-    if (key == NULL) {
-
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    rc = ngx_http_complex_value(r, &conf->cache_key, key);
-
-    if (rc != NGX_OK) {
-
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    r->cache = c;
-    c->body_start = ngx_pagesize;
-    c->min_uses = 1;
-    c->file_cache = conf->cache->data;
-    c->file.log = r->connection->log;
-    ngx_http_file_cache_create_key(r);
-
-skip_alloc:
-    rc = ngx_http_file_cache_open(r);
-
-    if (rc != NGX_OK) {
-
-        if (rc == NGX_HTTP_CACHE_STALE) {
-            /*
-            * Revert c->node->updating = 1, we want this to be true only when
-            * module is in the process of copying given file.
-            */
-            ngx_shmtx_lock(&c->file_cache->shpool->mutex);
-            c->node->updating = 0;
-
-            c->updating = 0;
-
-            ngx_shmtx_unlock(&c->file_cache->shpool->mutex);
-
-            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "pngquant_cache (stale)");
-
-        } else if (rc == NGX_HTTP_CACHE_UPDATING) {
-
-            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "pngquant_cache (updating)");
-
-        } else {
-
-            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "pngquant_cache (miss)");
-        }
-
-        return NGX_DECLINED;
-    }
-
-    r->connection->log->action = "sending cached response to client";
-
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "pngquant_cache (hit)");
-
-    r->headers_out.status = NGX_HTTP_OK;
-    r->headers_out.content_length_n = c->length - c->body_start;
-    r->headers_out.last_modified_time = c->last_modified;
-
-    if (ngx_http_set_content_type(r) != NGX_OK) {
-
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    r->allow_ranges = 1;
-
-    return ngx_http_cache_send(r);
-}
-
-
 static ngx_int_t
 ngx_http_pngquant_header_filter(ngx_http_request_t *r)
 {
@@ -967,61 +741,6 @@ ngx_http_pngquant_header_filter(ngx_http_request_t *r)
 }
 
 
-ngx_int_t
-ngx_http_pngquant_content_handler(ngx_http_request_t *r)
-{
-    ngx_http_pngquant_conf_t  *conf;
-    ngx_int_t rc;
-
-    conf = ngx_http_get_module_loc_conf(r, ngx_http_pngquant_module);
-
-    if (!conf->enabled || !conf->cache) {
-
-        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "pngquant_content_handler (-)");
-
-        return NGX_DECLINED;
-    }
-
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "pngquant_content_handler (+)");
-
-    if (!(r->method & (NGX_HTTP_GET|NGX_HTTP_HEAD))) {
-
-        return NGX_HTTP_NOT_ALLOWED;
-    }
-
-    if (r->uri.data[r->uri.len - 1] == '/') {
-
-        return NGX_DECLINED;
-    }
-
-    rc = ngx_http_discard_request_body(r);
-
-    if (rc != NGX_OK) {
-
-        return rc;
-    }
-
-#if defined(nginx_version) \
-    && ((nginx_version < 7066) \
-            || ((nginx_version >= 8000) && (nginx_version < 8038)))
-    if (r->zero_in_uri) {
-
-        return NGX_DECLINED;
-    }
-#endif
-
-    rc = ngx_http_pngquant_cache_send(r);
-
-    if (rc == NGX_DECLINED) {
-
-        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "pngquant_content_handler (cache_miss)");
-    }
-
-    return rc;
-}
-
-
 static void *
 ngx_http_pngquant_create_conf(ngx_conf_t *cf)
 {
@@ -1034,19 +753,11 @@ ngx_http_pngquant_create_conf(ngx_conf_t *cf)
         return NULL;
     }
 
-    /*
-     * via ngx_pcalloc():
-     * conf->cache_key = NULL;
-     * conf->temp_path = NULL;
-     */
-
     conf->enabled = NGX_CONF_UNSET;
     conf->buffer_size = NGX_CONF_UNSET_SIZE;
     conf->dither = NGX_CONF_UNSET;
     conf->colors = NGX_CONF_UNSET_UINT;
     conf->speed = NGX_CONF_UNSET_UINT;
-    conf->cache = NGX_CONF_UNSET_PTR;
-    conf->cache_valid = NGX_CONF_UNSET_PTR;
 
     return conf;
 }
@@ -1069,22 +780,6 @@ ngx_http_pngquant_merge_conf(ngx_conf_t *cf, void *parent, void *child)
 
     ngx_conf_merge_uint_value(conf->speed, prev->speed, 0);
 
-    ngx_conf_merge_ptr_value(conf->cache, prev->cache, NULL);
-
-    ngx_conf_merge_ptr_value(conf->cache_valid, prev->cache_valid, NULL);
-
-    if (conf->cache_key.value.data == NULL) {
-
-        conf->cache_key = prev->cache_key;
-    }
-
-    if (ngx_conf_merge_path_value(cf, &conf->temp_path, prev->temp_path,
-                                  &ngx_http_pngquant_temp_path) != NGX_OK)
-    {
-
-        return NGX_CONF_ERROR;
-    }
-
     if (conf->colors < 1) {
 
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
@@ -1101,35 +796,12 @@ ngx_http_pngquant_merge_conf(ngx_conf_t *cf, void *parent, void *child)
         return NGX_CONF_ERROR;
     }
 
-    if (conf->cache && conf->cache->data == NULL) {
-
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "\"pngquant_cache\" zone \"%V\" is unknown",
-                           &conf->cache->shm.name);
-
-        return NGX_CONF_ERROR;
-    }
-
     return NGX_CONF_OK;
 }
 
 static ngx_int_t
 ngx_http_pngquant_init(ngx_conf_t *cf)
 {
-    ngx_http_handler_pt *h;
-    ngx_http_core_main_conf_t *conf;
-
-    conf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
-
-    h = ngx_array_push(&conf->phases[NGX_HTTP_CONTENT_PHASE].handlers);
-
-    if (h == NULL) {
-
-        return NGX_ERROR;
-    }
-
-    *h = ngx_http_pngquant_content_handler;
-
     ngx_http_next_header_filter = ngx_http_top_header_filter;
     ngx_http_top_header_filter = ngx_http_pngquant_header_filter;
 
@@ -1138,5 +810,3 @@ ngx_http_pngquant_init(ngx_conf_t *cf)
 
     return NGX_OK;
 }
-
-//#endif /* NGX_HTTP_CACHE */
