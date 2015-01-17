@@ -7,7 +7,6 @@
 * Copyright (C) x25 <job@x25.ru>
 */
 
-//#if (NGX_HTTP_CACHE)
 
 #include <ngx_config.h>
 #include <ngx_core.h>
@@ -369,7 +368,9 @@ ngx_http_pngquant_asis(ngx_http_request_t *r, ngx_http_pngquant_ctx_t *ctx)
     ngx_buf_t  *b;
 
     b = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
+
     if (b == NULL) {
+
         return NULL;
     }
 
@@ -573,7 +574,137 @@ outOfMemory:
 }
 
 
-/*@TODO*/
+void
+ngx_http_pngquant_cache_update(ngx_http_request_t *r, u_char * img_data,
+int img_size)
+{
+    ngx_http_pngquant_conf_t *conf;
+    ngx_temp_file_t *tf;
+    ngx_http_cache_t *c;
+    ngx_int_t rc;
+
+    u_char *buf;
+    time_t valid, now;
+    size_t len;
+    ssize_t n;
+
+    c = r->cache;
+
+    ngx_shmtx_lock(&c->file_cache->shpool->mutex);
+
+    if (c->node->updating) {
+
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "pngquant_cache_update (updating)");
+
+        /* race between concurrent processes */
+        c->node->count--;
+        ngx_shmtx_unlock(&c->file_cache->shpool->mutex);
+
+        return;
+    }
+
+    c->node->updating = 1;
+    c->updating = 1;
+
+    ngx_shmtx_unlock(&c->file_cache->shpool->mutex);
+
+    r->connection->log->action = "populating cache";
+
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "http file cache copy: \"%s\" to \"%s\"",
+                   "path->data", c->file.name.data);
+
+    len = 8 * ngx_pagesize;
+
+    tf = ngx_pcalloc(r->pool, sizeof(ngx_temp_file_t));
+
+    if (tf == NULL) {
+
+        goto failed;
+    }
+
+    buf = ngx_palloc(r->pool, len);
+
+    if (buf == NULL) {
+
+        goto failed;
+    }
+
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_pngquant_module);
+    valid = ngx_http_file_cache_valid(conf->cache_valid, 200);
+
+    now = ngx_time();
+
+    c->valid_sec = now + valid;
+    c->date = now;
+    c->last_modified = r->headers_out.last_modified_time;
+
+    /*
+    * We don't save headers, but we add empty line
+    * as a workaround for older nginx versions,
+    * so c->header_start < c->body_start.
+    */
+    c->body_start = c->header_start + 1;
+
+    ngx_http_file_cache_set_header(r, buf);
+
+    *(buf + c->header_start) = LF;
+
+    tf->file.fd = NGX_INVALID_FILE;
+    tf->file.log = r->connection->log;
+    tf->path = conf->temp_path;
+    tf->pool = r->pool;
+    tf->persistent = 1;
+
+    rc = ngx_create_temp_file(&tf->file, tf->path, tf->pool, tf->persistent,
+                              tf->clean, tf->access);
+
+    if (rc != NGX_OK) {
+
+        goto failed;
+    }
+
+    n = ngx_write_fd(tf->file.fd, buf, c->body_start);
+
+    if ((size_t) n != c->body_start) {
+
+        goto failed;
+    }
+
+    n = ngx_write_fd(tf->file.fd, img_data, img_size);
+
+    if (n == NGX_FILE_ERROR) {
+
+        ngx_log_error(NGX_LOG_ALERT, r->connection->log, ngx_errno,
+                      ngx_write_fd_n " \"%s\" failed", tf->file.name.data);
+
+        goto failed;
+    }
+
+    if ((size_t) n != img_size) {
+
+        ngx_log_error(NGX_LOG_ALERT, r->connection->log, ngx_errno,
+                      ngx_write_fd_n " has written only %z of %uz bytes",
+                      n, img_size);
+
+        goto failed;
+    }
+
+
+    ngx_http_file_cache_update(r, tf);
+
+    return;
+
+failed:
+
+    ngx_log_error(NGX_LOG_ALERT, r->connection->log, ngx_errno,
+                  "http file cache copy: \"%s\" failed", "path->data");
+
+    ngx_http_file_cache_free(c, tf);
+
+    return;
+}
 
 
 static ngx_buf_t *
@@ -584,8 +715,9 @@ ngx_http_pngquant_quantize(ngx_http_request_t *r, ngx_http_pngquant_ctx_t *ctx)
     ngx_pool_cleanup_t        *cln;
     ngx_http_pngquant_conf_t  *conf;
     gdImagePtr                 img;
-//    time_t                     valid;
     int                        size;
+    ngx_http_cache_t          *c;
+    time_t                     valid;
 
     img = gdImageCreateFromPngPtr(ctx->length, ctx->image);
 
@@ -646,7 +778,79 @@ ngx_http_pngquant_quantize(ngx_http_request_t *r, ngx_http_pngquant_ctx_t *ctx)
     b->memory = 1;
     b->last_buf = 1;
 
-    /*@TODO*/
+    if (conf->cache) {
+
+        valid = ngx_http_file_cache_valid(conf->cache_valid, 200);
+
+        /* Don't cache content that instantly expires. */
+        if (valid
+//#if defined(nginx_version) && (nginx_version < 8031)
+//              /*
+//              * Don't cache 0 byte files, because nginx doesn't flush response
+//              * while serving them from cache and client timeouts.
+//              * This has been fixed in nginx-0.8.31.
+//              */
+//
+//              && of.size
+//#endif
+        ) {
+
+            c = r->cache;
+
+            ngx_shmtx_lock(&c->file_cache->shpool->mutex);
+
+            if (c->node->uses >= c->min_uses && !c->node->updating) {
+
+                ngx_shmtx_unlock(&c->file_cache->shpool->mutex);
+
+//#if defined(nginx_version) && (nginx_version < 8048)
+//              slowctx = ngx_http_get_module_ctx(r, ngx_http_slowfs_module);
+//              old_status = slowctx->cache_status;
+//#endif
+
+//#if defined(nginx_version) && (nginx_version >= 1001012)
+                ngx_shmtx_lock(&c->file_cache->shpool->mutex);
+                c->node->count++;
+                ngx_shmtx_unlock(&c->file_cache->shpool->mutex);
+//#endif
+
+                ngx_http_pngquant_cache_update(r, out, size);
+
+                /* Allow cache_cleanup after cache_update. */
+                c->updated = 0;
+
+//#if defined(nginx_version) && (nginx_version < 8048)
+//              if (old_status == NGX_HTTP_CACHE_EXPIRED) {
+//                  /*
+//                  * Expired cached files don't increment counter,
+//                  * because ngx_http_file_cache_exists isn't called.
+//                  */
+//
+//                  ngx_shmtx_lock(&c->file_cache->shpool->mutex);
+//                  c->node->count++;
+//                  ngx_shmtx_unlock(&c->file_cache->shpool->mutex);
+//              }
+//#endif
+//                rc = ngx_http_slowfs_cache_send(r);
+
+//#if defined(nginx_version) && (nginx_version < 8048)
+//              slowctx->cache_status = old_status;
+//#endif
+
+//                if (rc != NGX_DECLINED) {
+//
+//                    return rc;
+//                }
+
+            } else {
+
+                ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "pngquant_quantize (updating)");
+
+                ngx_shmtx_unlock(&c->file_cache->shpool->mutex);
+            }
+        }
+    }
 
     ngx_http_pngquant_length(r, b);
 //    ngx_http_weak_etag(r);
@@ -1116,6 +1320,9 @@ ngx_http_pngquant_merge_conf(ngx_conf_t *cf, void *parent, void *child)
 static ngx_int_t
 ngx_http_pngquant_init(ngx_conf_t *cf)
 {
+
+    //#if (NGX_HTTP_CACHE)
+
     ngx_http_handler_pt *h;
     ngx_http_core_main_conf_t *conf;
 
@@ -1130,6 +1337,8 @@ ngx_http_pngquant_init(ngx_conf_t *cf)
 
     *h = ngx_http_pngquant_content_handler;
 
+    //#endif /* NGX_HTTP_CACHE */
+
     ngx_http_next_header_filter = ngx_http_top_header_filter;
     ngx_http_top_header_filter = ngx_http_pngquant_header_filter;
 
@@ -1138,5 +1347,3 @@ ngx_http_pngquant_init(ngx_conf_t *cf)
 
     return NGX_OK;
 }
-
-//#endif /* NGX_HTTP_CACHE */
