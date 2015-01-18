@@ -33,6 +33,8 @@ typedef struct {
     ngx_flag_t                   dither;
     ngx_uint_t                   colors;
     ngx_uint_t                   speed;
+    ngx_http_complex_value_t    *store;
+    ngx_path_t                  *temp_path;
 } ngx_http_pngquant_conf_t;
 
 
@@ -51,6 +53,8 @@ static void *ngx_http_pngquant_create_conf(ngx_conf_t *cf);
 static char *ngx_http_pngquant_merge_conf(ngx_conf_t *cf, void *parent,
     void *child);
 static ngx_int_t ngx_http_pngquant_init(ngx_conf_t *cf);
+static char *
+ngx_http_pngquant_store_command(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 
 
 static ngx_command_t  ngx_http_pngquant_commands[] = {
@@ -90,6 +94,20 @@ static ngx_command_t  ngx_http_pngquant_commands[] = {
       offsetof(ngx_http_pngquant_conf_t, speed),
       NULL },
 
+    { ngx_string("pngquant_store"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_pngquant_store_command,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("pngquant_temp_path"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1234,
+      ngx_conf_set_path_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pngquant_conf_t, temp_path),
+      NULL },
+
       ngx_null_command
 };
 
@@ -127,6 +145,11 @@ ngx_module_t  ngx_http_pngquant_module = {
 
 static ngx_http_output_header_filter_pt  ngx_http_next_header_filter;
 static ngx_http_output_body_filter_pt    ngx_http_next_body_filter;
+
+
+static ngx_path_init_t ngx_http_pngquant_temp_path = {
+    ngx_string("/tmp"), { 1, 2, 0 }
+};
 
 
 static ngx_str_t  ngx_http_pngquant_content_type[] = {
@@ -462,7 +485,6 @@ outOfMemory:
 
 /*@TODO*/
 
-
 static ngx_buf_t *
 ngx_http_pngquant_quantize(ngx_http_request_t *r, ngx_http_pngquant_ctx_t *ctx)
 {
@@ -471,8 +493,15 @@ ngx_http_pngquant_quantize(ngx_http_request_t *r, ngx_http_pngquant_ctx_t *ctx)
     ngx_pool_cleanup_t        *cln;
     ngx_http_pngquant_conf_t  *conf;
     gdImagePtr                 img;
-//    time_t                     valid;
     int                        size;
+
+    ngx_int_t                  rc;
+    ngx_temp_file_t           *tf;
+    ssize_t                    n;
+    ngx_ext_rename_file_t      ext;
+    ngx_str_t                  dest;
+    ngx_str_t                  value;
+
 
     img = gdImageCreateFromPngPtr(ctx->length, ctx->image);
 
@@ -502,27 +531,101 @@ ngx_http_pngquant_quantize(ngx_http_request_t *r, ngx_http_pngquant_ctx_t *ctx)
     if (out == NULL) {
 
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-            "gdImagePngPtr() failed");
+                      "gdImagePngPtr() failed");
 
         return NULL;
+    }
+
+    if (conf->store) {
+
+        if(ngx_http_complex_value(r, conf->store, &value) != NGX_OK) {
+
+            goto failed;
+        }
+
+        dest.len = value.len + 1;
+        dest.data = ngx_pnalloc(r->pool, dest.len);
+
+        if (dest.data == NULL) {
+
+            goto failed;
+        }
+
+        ngx_memzero(dest.data, dest.len);
+        ngx_memcpy(dest.data, value.data, value.len);
+
+        ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "pngquant_store (%s)", dest.data);
+
+        tf = ngx_pcalloc(r->pool, sizeof(ngx_temp_file_t));
+
+        if (tf == NULL) {
+
+            goto failed;
+        }
+
+        tf->file.fd = NGX_INVALID_FILE;
+        tf->file.log = r->connection->log;
+        tf->path = conf->temp_path;
+        tf->pool = r->pool;
+        tf->persistent = 1;
+        rc = ngx_create_temp_file(&tf->file, tf->path, tf->pool, tf->persistent,
+                                  tf->clean, tf->access);
+
+        if (rc != NGX_OK) {
+
+            goto failed;
+        }
+
+        n = ngx_write_fd(tf->file.fd, out, size);
+
+        if (n == NGX_FILE_ERROR) {
+
+            ngx_log_error(NGX_LOG_ALERT, r->connection->log, ngx_errno,
+                          ngx_write_fd_n " \"%s\" failed", tf->file.name.data);
+
+            goto failed;
+        }
+
+        if ((int) n != size) {
+
+            ngx_log_error(NGX_LOG_ALERT, r->connection->log, ngx_errno,
+                          ngx_write_fd_n " has written only %z of %uz bytes",
+                          n, size);
+
+            goto failed;
+        }
+
+        ext.access = NGX_FILE_OWNER_ACCESS;
+        ext.path_access = NGX_FILE_OWNER_ACCESS;
+        ext.time = -1;
+        ext.create_path = 1;
+        ext.delete_file = 1;
+        ext.log = r->connection->log;
+
+        rc = ngx_ext_rename_file(&tf->file.name, &dest, &ext);
+
+        if (rc != NGX_OK) {
+
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "ngx_ext_rename_file() failed");
+
+            goto failed;
+        }
     }
 
     cln = ngx_pool_cleanup_add(r->pool, 0);
 
     if (cln == NULL) {
 
-        gdFree(out);
-
-        return NULL;
+        goto failed;
     }
 
     b = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
 
     if (b == NULL) {
 
-        gdFree(out);
-
-        return NULL;
+        goto failed;
     }
 
     cln->handler = ngx_http_pngquant_cleanup;
@@ -536,9 +639,18 @@ ngx_http_pngquant_quantize(ngx_http_request_t *r, ngx_http_pngquant_ctx_t *ctx)
     /*@TODO*/
 
     ngx_http_pngquant_length(r, b);
-//    ngx_http_weak_etag(r);
+
+#if defined(nginx_version) && (nginx_version >= 1007003)
+    ngx_http_weak_etag(r);
+#endif
 
     return b;
+
+failed:
+
+    gdFree(out);
+
+    return NULL;
 }
 
 
@@ -750,14 +862,21 @@ ngx_http_pngquant_create_conf(ngx_conf_t *cf)
 
     if (conf == NULL) {
 
-        return NULL;
+        return NGX_CONF_ERROR;
     }
+
+    /*
+     * via ngx_pcalloc():
+     * conf->store = NULL;
+     * conf->temp_path = NULL;
+     */
 
     conf->enabled = NGX_CONF_UNSET;
     conf->buffer_size = NGX_CONF_UNSET_SIZE;
     conf->dither = NGX_CONF_UNSET;
     conf->colors = NGX_CONF_UNSET_UINT;
     conf->speed = NGX_CONF_UNSET_UINT;
+    conf->store = NGX_CONF_UNSET_PTR;
 
     return conf;
 }
@@ -779,6 +898,14 @@ ngx_http_pngquant_merge_conf(ngx_conf_t *cf, void *parent, void *child)
                               1 * 1024 * 1024);
 
     ngx_conf_merge_uint_value(conf->speed, prev->speed, 0);
+
+    if (ngx_conf_merge_path_value(cf, &conf->temp_path, prev->temp_path,
+                                  &ngx_http_pngquant_temp_path) != NGX_OK)
+    {
+        return NGX_CONF_ERROR;
+    }
+
+    ngx_conf_merge_ptr_value(conf->store, prev->store, NULL);
 
     if (conf->colors < 1) {
 
@@ -809,4 +936,34 @@ ngx_http_pngquant_init(ngx_conf_t *cf)
     ngx_http_top_body_filter = ngx_http_pngquant_body_filter;
 
     return NGX_OK;
+}
+
+static char *
+ngx_http_pngquant_store_command(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_pngquant_conf_t          *pqlc = conf;
+    ngx_str_t                         *value;
+    ngx_http_compile_complex_value_t   ccv;
+
+    value = cf->args->elts;
+
+    pqlc->store = ngx_palloc(cf->pool, sizeof(ngx_http_complex_value_t));
+
+    if(pqlc->store == NULL) {
+
+        return NGX_CONF_ERROR;
+    }
+
+    ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+
+    ccv.cf = cf;
+    ccv.value = &value[1];
+    ccv.complex_value = pqlc->store;
+
+    if(ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
 }
