@@ -1,10 +1,14 @@
 /*
-* Copyright (C) Igor Sysoev
-* Copyright (C) Nginx, Inc.
-* Copyright (C) Kornel Lesiński (libimagequant)
-* Copyright (C) Thomas G. Lane. (libgd)
-* Copyright (C) x25 <job@x25.ru>
-*/
+ * Copyright (C) Igor Sysoev
+ * Copyright (C) Nginx, Inc.
+ * Copyright (C) Kornel Lesiński (libimagequant)
+ * Copyright (C) Thomas G. Lane. (libgd)
+ * Copyright (C) x25 <job@x25.ru>
+ */
+
+/*
+ * Based on nginx/ngx_http_image_filter_module.c
+ */
 
 
 #include <ngx_config.h>
@@ -315,6 +319,9 @@ ngx_pngquant_free_true_color_image_data(gdImagePtr oim)
 }
 
 
+/**
+ * Based on libgd/gd_topal.c
+ */
 static void
 ngx_pngquant_convert_gd_pixel_to_rgba(liq_color output_row[], int y, int width,
     void *userinfo)
@@ -340,6 +347,9 @@ ngx_pngquant_convert_gd_pixel_to_rgba(liq_color output_row[], int y, int width,
 }
 
 
+/**
+ * Based on libgd/gd_topal.c
+ */
 static int
 ngx_pngquant_gd_image(gdImagePtr oim, int dither, int colorsWanted, int speed)
 {
@@ -482,8 +492,6 @@ outOfMemory:
     return 0;
 }
 
-
-/*@TODO*/
 
 static ngx_buf_t *
 ngx_http_pngquant_quantize(ngx_http_request_t *r, ngx_http_pngquant_ctx_t *ctx)
@@ -635,8 +643,6 @@ ngx_http_pngquant_quantize(ngx_http_request_t *r, ngx_http_pngquant_ctx_t *ctx)
     b->last = out + size;
     b->memory = 1;
     b->last_buf = 1;
-
-    /*@TODO*/
 
     ngx_http_pngquant_length(r, b);
 

@@ -1,7 +1,7 @@
 Module ngx_pngquant
 ============
 
-The ``ngx_pngquant`` module is a filter for lossy compression of PNG images. 
+The ``ngx_pngquant`` module is a filter for lossy compression of PNG images.
 
 ## Example Configuration
 
@@ -31,7 +31,7 @@ sudo apt-get install build-essential libgd-dev
 sudo yum install gcc-c++ gd-devel make
 ```
 
-Download `ngx_pngquant` and install [libimagequant](https://github.com/pornel/pngquant) submodule:
+Download ``ngx_pngquant`` and install ``libimagequant`` submodule:
 
 ```sh
 cd
@@ -56,7 +56,7 @@ sudo make install
 Start nginx with pngquant module:
 
 ```sh
-/tmp/nginx/sbin/nginx -t -c /path/to/nginx.conf
+/tmp/nginx/sbin/nginx -c /path/to/nginx.conf
 ```
 
 ## Directives
@@ -125,8 +125,6 @@ An example of caching:
 
 ```nginx
 server {
-    listen 8080;
-
     root /var/www;
 
     location ~ \.png$ {
