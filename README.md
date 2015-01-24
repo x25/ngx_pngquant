@@ -5,22 +5,26 @@ The ``ngx_pngquant`` module is a filter for lossy compression of PNG images.
 
 ## Configuration
 
-Minimal:
-
 ```nginx
-location ~ \.png$ {
-    pngquant on;
-}
-```
-:
+server {
+    root /var/www;
 
-```nginx
-location ~ \.png$ {
-    pngquant on;
-    pngquant_buffer_size 1M;
-    pngquant_colors 256;
-    pngquant_dither on;
-    pngquant_speed 1;
+    location ~ \.png$ {
+        root /tmp/pngquant;
+        try_files $uri @pngquant;
+    }
+
+    location @pngquant {
+        pngquant on;
+
+        pngquant_buffer_size 1M;
+        pngquant_colors 256;
+        pngquant_dither on;
+        pngquant_speed 1;
+
+        pngquant_store /tmp/pngquant$uri;
+        pngquant_store_access user:rw group:rw all:r;
+    }
 }
 ```
 
