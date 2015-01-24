@@ -38,6 +38,7 @@ typedef struct {
     ngx_uint_t                   colors;
     ngx_uint_t                   speed;
     ngx_http_complex_value_t    *store;
+    ngx_uint_t                   store_access;
     ngx_path_t                  *temp_path;
 } ngx_http_pngquant_conf_t;
 
@@ -110,6 +111,13 @@ static ngx_command_t  ngx_http_pngquant_commands[] = {
       ngx_conf_set_path_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_pngquant_conf_t, temp_path),
+      NULL },
+
+    { ngx_string("pngquant_store_access"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE123,
+      ngx_conf_set_access_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_pngquant_conf_t, store_access),
       NULL },
 
       ngx_null_command
@@ -604,8 +612,8 @@ ngx_http_pngquant_quantize(ngx_http_request_t *r, ngx_http_pngquant_ctx_t *ctx)
             goto failed;
         }
 
-        ext.access = NGX_FILE_OWNER_ACCESS;
-        ext.path_access = NGX_FILE_OWNER_ACCESS;
+        ext.access = conf->store_access;
+        ext.path_access = conf->store_access;
         ext.time = -1;
         ext.create_path = 1;
         ext.delete_file = 1;
@@ -883,6 +891,7 @@ ngx_http_pngquant_create_conf(ngx_conf_t *cf)
     conf->colors = NGX_CONF_UNSET_UINT;
     conf->speed = NGX_CONF_UNSET_UINT;
     conf->store = NGX_CONF_UNSET_PTR;
+    conf->store_access = NGX_CONF_UNSET_UINT;
 
     return conf;
 }
@@ -912,6 +921,9 @@ ngx_http_pngquant_merge_conf(ngx_conf_t *cf, void *parent, void *child)
     }
 
     ngx_conf_merge_ptr_value(conf->store, prev->store, NULL);
+
+    ngx_conf_merge_uint_value(conf->store_access,
+                              prev->store_access, NGX_FILE_OWNER_ACCESS);
 
     if (conf->colors < 1) {
 

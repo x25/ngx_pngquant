@@ -3,7 +3,16 @@ Module ngx_pngquant
 
 The ``ngx_pngquant`` module is a filter for lossy compression of PNG images.
 
-## Example Configuration
+## Configuration
+
+Minimal:
+
+```nginx
+location ~ \.png$ {
+    pngquant on;
+}
+```
+:
 
 ```nginx
 location ~ \.png$ {
@@ -119,7 +128,9 @@ Speed is from 1 (highest quality) to 10 (fastest). Speed 0 selects library-speci
 
 Enables saving of processed images to a disk. The file name can be set explicitly using the string with variables: 
 
-> ``pngquant_store /data/www$original_uri;``
+```
+pngquant_store /data/www$uri;
+```
 
 An example of caching:
 
@@ -148,3 +159,31 @@ server {
 </table>
 
 Sets temporary area where files are stored before they are moved to ``pngquant_store`` area.
+
+---
+
+<table cellspacing="0">
+<tr><th>Syntax:</th><td><code><strong>pngquant_store_access</strong> <i>users:permissions ...</i>;</code></td></tr>
+<tr><th>Default:</th><td><code>pngquant_store_access user:rw;</code></td></tr>
+<tr><th>Context:</th><td><code>http</code>, <code>server</code>, <code>location</code></td></tr>
+</table>
+
+Sets access permissions for newly created files and directories, e.g.: 
+
+```
+pngquant_store_access user:rw group:rw all:r;
+```
+
+If any ``group`` or ``all`` access permissions are specified then user permissions may be omitted: 
+
+```
+pngquant_store_access group:rw all:r;
+```
+
+## Status
+
+This module is experimental and it's compatible with following nginx
+releases:
+
+- 1.6.x (tested with 1.6.2).
+- 1.7.x (tested with 1.7.9).
