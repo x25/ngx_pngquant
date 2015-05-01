@@ -7,10 +7,13 @@ The ``ngx_pngquant`` module is a filter for lossy compression of PNG images.
 
 ```nginx
 server {
+
+    set $store_path /tmp/pngquant;
+
     root /var/www;
 
     location ~ \.png$ {
-        root /tmp/pngquant;
+        root $store_path;
         try_files $uri @pngquant;
     }
 
@@ -22,7 +25,7 @@ server {
         pngquant_dither on;
         pngquant_speed 1;
 
-        pngquant_store /tmp/pngquant$uri;
+        pngquant_store $store_path$uri;
         pngquant_store_access user:rw group:rw all:r;
     }
 }
@@ -41,7 +44,7 @@ sudo apt-get install build-essential libgd-dev
 **RedHat, CentOS, or Fedora**
 
 ```sh
-sudo yum install gcc-c++ gd-devel make
+sudo yum install gcc-c++ gd-devel pcre-devel make
 ```
 
 Download ``ngx_pngquant`` and install ``libimagequant`` submodule:
@@ -53,7 +56,7 @@ cd ngx_pngquant
 git submodule update --init
 ```
 
-Download and build **nginx**/**openresty** with support for ``ngx_pngquant``:
+Download and build **nginx**/**openresty**/**tengine** with support for ``ngx_pngquant``:
 
 ```sh
 cd
@@ -64,6 +67,12 @@ cd nginx-1.6.2/
 ./configure --prefix=/tmp/nginx --add-module=$HOME/ngx_pngquant
 make
 sudo make install
+```
+
+If you want to have debug logs available:
+
+```sh
+./configure --prefix=/tmp/nginx --add-module=$HOME/ngx_pngquant --with-debug
 ```
 
 Start nginx with pngquant module:
@@ -186,8 +195,10 @@ pngquant_store_access group:rw all:r;
 
 ## Status
 
-This module is experimental and it's compatible with following nginx
-releases:
+This module is experimental and it's compatible with following web servers:
 
-- 1.6.x (tested with 1.6.2).
-- 1.7.x (tested with 1.7.9).
+- nginx 1.6.x (tested with 1.6.2).
+- nginx 1.7.x (tested with 1.7.9).
+
+- openresty 1.7.x (tested with 1.7.7.1).
+- tengine 2.1.x (tested with 2.1.0).
